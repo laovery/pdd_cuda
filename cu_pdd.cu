@@ -12,8 +12,23 @@
 
 #include "cu_pdd.h"
 
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600
+  static __inline__ __device__ double atomicAdd(double *address, double val) {
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    if (val==0.0)
+      return __longlong_as_double(old);
+    do {
+      assumed = old;
+      old = atomicCAS(address_as_ull, assumed, __double_as_longlong(val +__longlong_as_double(assumed)));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+  }
+  #endif
 
-__device__ cuDoubleComplex global_v[32] = {0,0.0};
+
+
+__device__ cuDoubleComplex global_v[256] = {0,0.0};
 
 
 
@@ -22,15 +37,22 @@ __global__ void w_update(
     double * w_d, 
     double * e_u, 
     double * e_d, 
+    double * A,
     int use) {
     int idx = threadIdx.x;
     if (idx < use) {
         w_u[ idx ] = 1.0 / (log(2.0) * e_u[ idx ]);
+        A[idx] = 0.0;
     }
     else if (idx < 2 * use) {
         w_d[ idx - use ] = 1.0 / (log(2.0)  * e_d[ idx - use ]);
     }
 }
+
+
+
+
+
 
 __global__ void p_update(
     double* p_u, 
@@ -41,6 +63,7 @@ __global__ void p_update(
     cuDoubleComplex* H_u,
     cuDoubleComplex* H1, 
     cuDoubleComplex* H3,
+    double* A,  //[a1,a1 .. ]
     double I_th,
     int M,
     int use)
@@ -50,14 +73,11 @@ __global__ void p_update(
     int s = blockIdx.y;
     int n = threadIdx.x;
 
-    global_v[n] = {0.0,0.0};
 
 
     __shared__ cuDoubleComplex H_H[32];
     H_H[n] = cuCmul(cuConj(v_u[s * M + n]) , H_u[k * M + n]);
-    //printf("%d %d %d: %f %f\n",k,s,n,v_u[s * M + n].x,v_u[s * M + n].y);
     
-
     __syncthreads();
 
     
@@ -77,53 +97,140 @@ __global__ void p_update(
         cuDoubleComplex hh = cuCmul(v_d[s], H1[k*use+s]);
         hh = cuCmul(make_cuDoubleComplex(w_d[s], 0.0), cuCmul(hh, cuConj(hh)));
         hh = cuCadd(hh, H_H[0]);
-        global_v[k*use+s] = hh;
+
+        atomicAdd(&A[k], hh.x);
     }
     __syncthreads();
-    __shared__ double B[32];
 
-    cuDoubleComplex b;
-    b = cuCmul(cuConj(v_u[k*M+n]), H_u[k*M+n]);
-    B[n] = b.x;
-    __syncthreads();
+    if(s == 0){
+        __shared__ double B[32];
 
-    for (size_t i = M/2; i > 0; i >>= 1)
-    {
-        if(n < i){
-            B[n] = B[n] + B[n + i];
+        cuDoubleComplex b=cuCmul(cuConj(v_u[k*M+n]), H_u[k*M+n]);
+        B[n] = b.x;
+        __syncthreads();
+
+        for (size_t i = M/2; i > 0; i >>= 1)
+        {
+            if(n < i){
+                B[n] = B[n] + B[n + i];
+            }
+            __syncthreads();
+            /* code */
         }
         __syncthreads();
-        /* code */
-    }
-    __syncthreads();
+        if(n == 0){
+            double bb = B[0]*w_u[k];
+            double a = A[k];
 
+            if(bb >= 0){
+                double p_use = 1.0;
+                double b_a = pow(bb / a,2);
+                double I_h3 = I_th / cuCreal(cuCmul(H3[k], cuConj(H3[k])));
 
-    double bb = B[0]*w_u[k];
-
-
-    if(s == 0 && n == 0){
-
-        cuDoubleComplex a = {0.0,0.0};
-        for(int i=0;i<use;i++){
-            a = cuCadd(a, global_v[k*use+i]);
+                p_u[k] = min(min(p_use, b_a) , I_h3);
+            }
+            else
+                p_u[k] = 0;
         }
 
-        cuDoubleComplex b = make_cuDoubleComplex(bb, 0.0);
-
-        if(b.x >= 0){
-            double p_use = 1.0;
-            double b_a = pow(cuCabs(cuCdiv(b , a)), 2);
-            double I_h3 = I_th / cuCreal(cuCmul(H3[k], cuConj(H3[k])));
-
-            p_u[k] = min(min(p_use, b_a) , I_h3);
-        }
-        else
-            p_u[k] = 0;
 
     }
-    __syncthreads();
+
+
 
 }
+
+// __global__ void p_update(
+//     double* p_u, 
+//     double* w_u,
+//     double* w_d,
+//     cuDoubleComplex* v_u,
+//     cuDoubleComplex* v_d,
+//     cuDoubleComplex* H_u,
+//     cuDoubleComplex* H1, 
+//     cuDoubleComplex* H3,
+//     double I_th,
+//     int M,
+//     int use)
+//     {
+//     //<<<(4,4);32>>>
+//     int k = blockIdx.x;
+//     int s = blockIdx.y;
+//     int n = threadIdx.x;
+
+//     global_v[n] = {0.0,0.0};
+
+
+//     __shared__ cuDoubleComplex H_H[32];
+//     H_H[n] = cuCmul(cuConj(v_u[s * M + n]) , H_u[k * M + n]);
+    
+
+//     __syncthreads();
+
+    
+//     for (size_t i = M/2; i > 0; i >>= 1)
+//     {
+//         if(n < i){
+//             H_H[n] = cuCadd(H_H[n] , H_H[n+i]);
+//         }
+//         /* code */
+//         __syncthreads();
+//     }
+//     __syncthreads();
+
+//     if(n == 0){
+//         H_H[0] = cuCmul(make_cuDoubleComplex(w_u[s], 0.0), cuCmul(H_H[0], cuConj(H_H[0])));
+        
+//         cuDoubleComplex hh = cuCmul(v_d[s], H1[k*use+s]);
+//         hh = cuCmul(make_cuDoubleComplex(w_d[s], 0.0), cuCmul(hh, cuConj(hh)));
+//         hh = cuCadd(hh, H_H[0]);
+//         global_v[k*use+s] = hh;
+//     }
+//     __syncthreads();
+//     __shared__ double B[32];
+
+//     cuDoubleComplex b;
+//     b = cuCmul(cuConj(v_u[k*M+n]), H_u[k*M+n]);
+//     B[n] = b.x;
+//     __syncthreads();
+
+//     for (size_t i = M/2; i > 0; i >>= 1)
+//     {
+//         if(n < i){
+//             B[n] = B[n] + B[n + i];
+//         }
+//         __syncthreads();
+//         /* code */
+//     }
+//     __syncthreads();
+
+
+//     double bb = B[0]*w_u[k];
+
+
+//     if(s == 0 && n == 0){
+
+//         cuDoubleComplex a = {0.0,0.0};
+//         for(int i=0;i<use;i++){
+//             a = cuCadd(a, global_v[k*use+i]);
+//         }
+
+//         cuDoubleComplex b = make_cuDoubleComplex(bb, 0.0);
+
+//         if(b.x >= 0){
+//             double p_use = 1.0;
+//             double b_a = pow(cuCabs(cuCdiv(b , a)), 2);
+//             double I_h3 = I_th / cuCreal(cuCmul(H3[k], cuConj(H3[k])));
+
+//             p_u[k] = min(min(p_use, b_a) , I_h3);
+//         }
+//         else
+//             p_u[k] = 0;
+
+//     }
+//     __syncthreads();
+
+// }
 
 
 //F_update
@@ -146,6 +253,7 @@ __global__ void XY_update(
 
     if(k == 0){
         __shared__ cuDoubleComplex w[1024];
+        w[n*M+m] = {0.0,0.0};
         cuDoubleComplex ww;
         for(int i=0;i<use;i++){
             ww = cuCmul(v_u[i*M+m],cuConj(v_u[i*M+n]));
@@ -160,6 +268,7 @@ __global__ void XY_update(
     }
     else if (k == 1) {
         __shared__ cuDoubleComplex h[1024];
+        h[n*M+m] = {0.0,0.0};
         cuDoubleComplex hh;
         for(int i=0;i<use;i++){
             hh = cuCmul(cuConj(v_d[i]), v_d[i]);
@@ -180,7 +289,7 @@ __global__ void XY_update(
       
 }
 
-__global__ void mat_add_I(cuDoubleComplex * x, float p){
+__global__ void mat_add_I(cuDoubleComplex * x, double p){
     int m = threadIdx.x;
     int n = threadIdx.y;
 
@@ -188,40 +297,10 @@ __global__ void mat_add_I(cuDoubleComplex * x, float p){
     int M = 32;
     if(m == n){
         x[m*M+n] = cuCadd(x[m*M+n], make_cuDoubleComplex(p, 0.0));
-        x[m*M+n].y = 0.0;
     }
 }
 
-// void inv(cuComplex * F, cuComplex * F_inv, int M){
-//     int num = 1; 
-//     cublasHandle_t cublasH;
-//     cublasCreate(&cublasH);
 
-//     cuComplex ** A = new cuComplex*[num];
-//     A[0] = F;
-//     cuComplex ** A_d ;
-//     cudaMalloc((void**)&A_d, num * sizeof(cuComplex *));
-//     cudaMemcpy(A_d, A, num * sizeof(cuComplex *), cudaMemcpyHostToDevice);
-
-//     int *info;
-//     int *pivot;
-//     cudaMalloc((void**)&info, num * sizeof(int));
-//     cudaMalloc((void**)&pivot, M * num * sizeof(int));
-
-//     //LU分解
-//     cublasCgetrfBatched(cublasH, M, A_d, M, pivot, info, num);
-
-//     cuComplex ** res = new cuComplex *[num];
-//     res[0] = F_inv;
-//     cuComplex ** res_d;
-//     cudaMalloc((void**)&res_d, num * sizeof(cuComplex *));
-//     cudaMemcpy(res_d, res, num*sizeof(cuComplex *), cudaMemcpyHostToDevice);
-
-    
-//     //求逆
-//     cublasCgetriBatched(cublasH, M, A_d, M, pivot, res_d, M, info, num );
-
-// }
 
 __global__ void fun6(cuDoubleComplex*A,int M){
     int n = threadIdx.x;
@@ -230,10 +309,7 @@ __global__ void fun6(cuDoubleComplex*A,int M){
 
 
 
-void inv(cuDoubleComplex * F, cuDoubleComplex * F_inv, int M){
-    cusolverDnHandle_t cusolverH;
-    cusolverDnCreate(&cusolverH);
-
+void inv(cuDoubleComplex * F, cuDoubleComplex * F_inv, int M,cusolverDnHandle_t cusolverH){
 
     int lwork;
     cuDoubleComplex * work;
@@ -243,73 +319,24 @@ void inv(cuDoubleComplex * F, cuDoubleComplex * F_inv, int M){
     
     cudaMalloc((void**)&work,lwork*sizeof(cuDoubleComplex));
     cudaMalloc((void**)&devIpiv, M * sizeof(int));
-    cusolverDnZgetrf(cusolverH, M, M, F, M, work, devIpiv, devInfo);
+    cusolverDnZgetrf(cusolverH, M, M, F, M, work, NULL, devInfo);
 
     fun6<<<1,M>>>(F_inv,M);
 
-    cusolverDnZgetrs(cusolverH, CUBLAS_OP_N, M, M, F, M, devIpiv, F_inv, M, devInfo);
-
+    cusolverDnZgetrs(cusolverH, CUBLAS_OP_N, M, M, F, M, NULL, F_inv, M, devInfo);
+    
+    //cusolverDnDestroy(cusolverH);
+    cudaFree(work);
+    cudaFree(devIpiv);
+    
 }
 
 
 
 
 
-// void inv(cuComplex *F,cuComplex *F_inv,int M){
 
-//     float *S;
-//     cuComplex * U, * V;
-//     cudaMalloc((void**)&S,M*sizeof(float));
-//     cudaMalloc((void**)&U,M*M*sizeof(cuComplex));
-//     cudaMalloc((void**)&V,M*M*sizeof(cuComplex));
-
-//     int lwork;
-//     cuComplex * work;
-//     float * rwork = nullptr;
-//     int *devInfo = nullptr;
-//     cusolverDnHandle_t cusolverH;
-//     cusolverDnCreate(&cusolverH);
-
-//     cusolverDnCgesvd_bufferSize(cusolverH,M,M,&lwork);
-//     cudaMalloc((void**)&work,lwork*sizeof(cuComplex));
-
-//     signed char jobu = 'A';
-//     signed char jobvt = 'A';
-
-//     cusolverDnCgesvd(
-//         cusolverH,jobu,jobvt,
-//         M,M,F,M,
-//         S,
-//         U,M,
-//         V,M,
-//         work,lwork,rwork,
-//         devInfo
-//     );
-//     cuComplex * VS;
-//     cudaMalloc((void**)&VS, M*M*sizeof(cuComplex));
-//     v_mul_s<<<1,dim3(M,M)>>>(V,S,VS,M,M);
-
-
-//     cuComplex alpha = make_cuComplex(1.0,0.0);
-//     cuComplex beta = make_cuComplex(0.0,0.0);
-
-//     cublasHandle_t cublasH;
-//     cublasCreate(&cublasH);
-//     cublasCgemm(
-//         cublasH,CUBLAS_OP_N,CUBLAS_OP_C,
-//         M,M,M,
-//         &alpha,
-//         VS,M,
-//         U,M,
-//         &beta, 
-//         F_inv,M
-//     );
-
-// }
-
-
-
-cuDoubleComplex * F_update(
+void F_update(
     cuDoubleComplex * F, 
     cuDoubleComplex * F_RF,
     cuDoubleComplex * F_BB,
@@ -320,10 +347,16 @@ cuDoubleComplex * F_update(
     cuDoubleComplex * H_d,
     cuDoubleComplex * H_SI,
     cuDoubleComplex * H1,
+    cuDoubleComplex * lambda,
     double p,
     int M,
-    int use){
+    int use,
+    cublasHandle_t cublasH,
+    cusolverDnHandle_t cusolverH
+    ){
 
+
+    //cublasCreate(&cublasH);
 
     cuDoubleComplex * X, * Y, * H, *w;
     cudaMalloc((void**)&X, M*M*sizeof(cuDoubleComplex));
@@ -334,22 +367,12 @@ cuDoubleComplex * F_update(
 
     dim3 block(32,32);
     XY_update<<<3, block>>>(w,H,Y,v_u,v_d,w_u,w_d,H_d,use);
-
-    cuDoubleComplex w_h[1024],test[1024],test2[1024];
-
-    // for(int i=0;i<32;i++){
-    //     printf("%d: %f %f\n",i,test[i].x,test[i].y);
-    // }
-    // for(int i=0;i<64;i++){
-    //     printf("%d: %f %f\n",i,test[i].x,test[i].y);
-    // }
-    
-    
+   
+    //cuDoubleComplex test[1024];
 
 
     //X Y TODO:可以使用stream
-    cublasHandle_t cublasH;
-    cublasCreate(&cublasH);
+
     cuDoubleComplex alpha = {1.0,0.0};
     cuDoubleComplex beta1 ={0.0,0.0};
     cuDoubleComplex beta2 ={1.0,0.0};
@@ -373,91 +396,74 @@ cuDoubleComplex * F_update(
         H,M
     );
 
-
+    //alphe = 0.08
     double temp = 0.5/p+0.08;
     mat_add_I<<<1,block>>>(H,temp);
 
-    cudaMemcpy(test,H,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
-    for(int i=0;i<65;i++){
-        printf("F %d: %f %f\n",i,test[i].x,test[i].y);
-    }
 
-    std::ofstream file("x.txt");
-
-
-    for(int i=0;i<M;i++){
-        for(int j=0;j<M;j++){
-            double x,y;
-            char c1,c2;
-            file << test[j*M+i].x << " + " << test[j*M+i].y << "i ";
-        }
-        file << std::endl;
-    }
-    file.close();
-
-    cuDoubleComplex * F_inv,*FF;
+    cuDoubleComplex * F_inv;
     cudaMalloc((void**)&F_inv, M*M*sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&FF, M*M*sizeof(cuDoubleComplex));
-    cudaMemcpy(FF,H,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToDevice);
-    
-    inv(H, F_inv, M);
 
+    // cudaMemcpy(test,H,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // for(int i=0;i<32*32;i++){
+    //     printf("H :%d: %f %f\n",i,test[i].x,test[i].y);
+    // }
+   
+    inv(H, F_inv, M,cusolverH);
 
-
-    cuDoubleComplex test5[1024];
-    cudaMemcpy(test5,F_inv,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
-    for(int i=0;i<65;i++){
-        printf("F_inv %d: %f %f\n",i,test5[i].x,test5[i].y);
-    }
-
-
-
-    cuDoubleComplex * E;
-    cudaMalloc((void**)&E,M*M*sizeof(cuDoubleComplex));
-    cublasZgemm(
-        cublasH,CUBLAS_OP_N,CUBLAS_OP_N,
-        M,M,M,&alpha,
-        FF,M,
-        F_inv,M,
-        &beta1,
-        E,M
-    );
-    cudaMemcpy(test2,E,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
-    for(int i=0;i<64;i++){
-        printf("E %d: %f %f\n",i,test2[i].x,test2[i].y);
-    }
-
-    return FF;
-
-
-
-
-    // float l = 0.5 / p;
-    // cuComplex alpha2 = {l,0.0};
-    // float N = 8;
-
-    // cublasCgemm(
-    //     cublasH,CUBLAS_OP_N,CUBLAS_OP_N,
-    //     M, use, N, &alpha2,
-    //     F_RF, M,
-    //     F_BB, N,
-    //     &beta2,
-    //     Y,M
-    // );
-    
-    // cudaMemcpy(test2,Y,M*use*sizeof(cuComplex),cudaMemcpyDeviceToHost);
-    // for(int i=0;i<32;i++){
-    //     printf("%d: %f %f\n",i,test2[i].x,test2[i].y);
+    // cudaMemcpy(test,F_inv,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // for(int i=0;i<32*32;i++){
+    //     printf("inv :%d: %f %f\n",i,test[i].x,test[i].y);
     // }
 
-    // cublasCgemm(
-    //     cublasH,CUBLAS_OP_N,CUBLAS_OP_N,
-    //     M,use,M,&alpha,
-    //     F_inv,M,
-    //     Y,M,
-    //     &beta1,
-    //     F,M
-    // );
+    double l = 0.5 / p;
+    cuDoubleComplex alpha2 = {l,0.0};
+    cuDoubleComplex beta3 = {-0.5,0.0};
+
+    int N = 8;
+
+    cublasZgemm(
+        cublasH,CUBLAS_OP_N,CUBLAS_OP_N,
+        M, use, N, &alpha2,
+        F_RF, M,
+        F_BB, N,
+        &beta2,
+        Y,M
+    );
+
+    cublasZgeam(
+        cublasH,
+        CUBLAS_OP_N,CUBLAS_OP_N,
+        M,use,
+        &alpha,
+        Y,M,
+        &beta3,
+        lambda,M,
+        Y,M
+    );
+    
+    // cudaMemcpy(test,Y,M*use*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // for(int i=0;i<32;i++){
+    //     printf("Y :%d: %f %f\n",i,test[i].x,test[i].y);
+    // }
+
+
+    cublasZgemm(
+        cublasH,CUBLAS_OP_N,CUBLAS_OP_N,
+        M,use,M,&alpha,
+        F_inv,M,
+        Y,M,
+        &beta1,
+        F,M
+    );
+
+
+    //cuDoubleComplex test[1024];
+    // cudaMemcpy(test,F,M*use*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // for(int i=0;i<4;i++){
+    //     printf("F :%d: %f %f\n",i,test[i].x,test[i].y);
+    // }
+
 
 }
 
@@ -479,113 +485,149 @@ void F_BB_update(
     cuDoubleComplex * F_RF,
     cuDoubleComplex * F,
     cuDoubleComplex * F_BB,
-    int use){
+    cuDoubleComplex * lambda,
+    double p,
+    int M,
+    int N,
+    int use,
+    cublasHandle_t cublasH,
+    cusolverDnHandle_t cusolverH){
 
-    int F_RF_m = 32;
-    int F_RF_n = 8;
 
     double *S;
     cuDoubleComplex * U, * V;
-    cudaMalloc((void**)&S,F_RF_m*sizeof(double));
-    cudaMalloc((void**)&U,F_RF_m*F_RF_m*sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&V,F_RF_n*F_RF_n*sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&S,M*sizeof(double));
+    cudaMalloc((void**)&U,M*M*sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&V,N*N*sizeof(cuDoubleComplex));
     
     
     int lwork;
     cuDoubleComplex * work;
     double * rwork = nullptr;
     int *devInfo = nullptr;
-    cusolverDnHandle_t cusolverH;
-    cusolverDnCreate(&cusolverH);
 
-    cusolverDnZgesvd_bufferSize(cusolverH,F_RF_m,F_RF_n,&lwork);
+    cusolverDnZgesvd_bufferSize(cusolverH,M,N,&lwork);
     cudaMalloc((void**)&work,lwork*sizeof(cuDoubleComplex));
     
     //SVD
     signed char jobu = 'A';
     signed char jobvt = 'A';
 
+    cuDoubleComplex * F_RF_;
+    cudaMalloc((void**)&F_RF_,M*N*sizeof(cuDoubleComplex));
+    cudaMemcpy(F_RF_,F_RF,M*N*sizeof(cuDoubleComplex),cudaMemcpyDeviceToDevice);
+
     cusolverDnZgesvd(
         cusolverH,jobu,jobvt,
-        F_RF_m,F_RF_n,F_RF,F_RF_m,
+        M,N,F_RF_,M,
         S,
-        U,F_RF_m,
-        V,F_RF_n,
+        U,M,
+        V,N,
         work,lwork,rwork,
         devInfo
     );
     
     cuDoubleComplex * VS;
-    cudaMalloc((void**)&VS, F_RF_n*F_RF_m*sizeof(cuDoubleComplex));
-    v_mul_s<<<1,dim3(F_RF_n,F_RF_m)>>>(V,S,VS,F_RF_m,F_RF_n);
+    cudaMalloc((void**)&VS, N*M*sizeof(cuDoubleComplex));
+    v_mul_s<<<1,dim3(N,M)>>>(V,S,VS,M,N);
 
     cuDoubleComplex alpha = make_cuDoubleComplex(1.0,0.0);
     cuDoubleComplex beta = make_cuDoubleComplex(0.0,0.0);
+    cuDoubleComplex beta_p = {p,0.0};
+
     cuDoubleComplex * F_RF_pinv;
-    cudaMalloc((void**)&F_RF_pinv, F_RF_n*F_RF_m*sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&F_RF_pinv, N*M*sizeof(cuDoubleComplex));
 
     
-    cublasHandle_t cublasH;
-    cublasCreate(&cublasH);
     cublasZgemm(
         cublasH,CUBLAS_OP_N,CUBLAS_OP_C,
-        F_RF_n,F_RF_m,F_RF_m,
+        N,M,M,
         &alpha,
-        VS,F_RF_n,
-        U,F_RF_m,
+        VS,N,
+        U,M,
         &beta, 
-        F_RF_pinv,F_RF_n
+        F_RF_pinv,N
     );
     
-    cublasZgemm(
-        cublasH,CUBLAS_OP_N,CUBLAS_OP_N,
-        F_RF_n,use,F_RF_m,
+    cuDoubleComplex * C;
+    cudaMalloc((void**)&C,M*use*sizeof(cuDoubleComplex));
+    cublasZgeam(
+        cublasH,
+        CUBLAS_OP_N,CUBLAS_OP_N,
+        M,use,
         &alpha,
-        F_RF_pinv,F_RF_n,
-        F,F_RF_m,
-        &beta,
-        F_BB,F_RF_n
+        F,M,
+        &beta_p,
+        lambda,M,
+        C,M
     );
 
+    cublasZgemm(
+        cublasH,CUBLAS_OP_N,CUBLAS_OP_N,
+        N,use,M,
+        &alpha,
+        F_RF_pinv,N,
+        C,M,
+        &beta,
+        F_BB,N
+    );
+
+    // cuDoubleComplex test[1024];
+    // cudaMemcpy(test,F_BB,N*use*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // for(int i=0;i<4;i++){
+    //     printf("F_BB :%d: %f %f\n",i,test[i].x,test[i].y);
+    // }
 }
 
 //F_RF_update
 
-__global__ void RF_update(cuComplex * F_RF, cuComplex * A ,cuComplex *B){
+__global__ void RF_update(
+    cuDoubleComplex * F_RF, 
+    cuDoubleComplex * A ,
+    cuDoubleComplex * B,
+    int M,
+    int N){
+    //<<<M,M>>>
     int k = blockIdx.x;
     int n = threadIdx.x;
-    int M = 32;
-    int N = 8;
-    __shared__ cuComplex V[32];
-    __shared__ cuComplex x[16];
+
+    __shared__ cuDoubleComplex V[32];
+    __shared__ cuDoubleComplex x[32];
     if(n < N){
         V[n] = F_RF[n*M+k]; 
     }
 
     for(int s=0;s<N;s++){
+        
+        x[n] = make_cuDoubleComplex(0.0, 0.0);
+        __syncthreads();
         if(n < N){
-            x[n] = cuCmulf(make_cuComplex(-1.0*V[n].x,-1.0*V[n].y),A[s*N+n] );
+            x[n] = cuCmul(make_cuDoubleComplex(-1.0*V[n].x,-1.0*V[n].y),A[s*N+n] );
         }
         else if(n == N){
-            x[n] = B[s*N+k];
+            x[n] = B[s*M+k];
         }
         else if(n == N+1){
-            x[n] = cuCmulf(V[s],A[s*N+s]);
+            x[n] = cuCmul(V[s],A[s*N+s]);
         }
         else{
-            x[n] = make_cuComplex(0.0,0.0);
+            x[n] = make_cuDoubleComplex(0.0,0.0);
         }
         __syncthreads();
 
-        for(int i = 8; i > 0 ; i >>= 1){
+        for(int i = M/2; i > 0 ; i >>= 1){
             if(n < i)
-                x[n] = cuCaddf(x[n], x[n+i]);
+                x[n] = cuCadd(x[n], x[n+i]);
             __syncthreads();
         }
         __syncthreads();
-        if(n==0)
-            V[s] = cuCdivf(x[0],make_cuComplex(cuCabsf(x[0]),0.0));
+        if(n==0){
+            V[s] = cuCdiv(x[0],make_cuDoubleComplex(cuCabs(x[0]),0.0));
+        
+        }
         __syncthreads();
+
+
     }
     if(n < N){
         F_RF[n*M+k] = V[n] ; 
@@ -595,168 +637,262 @@ __global__ void RF_update(cuComplex * F_RF, cuComplex * A ,cuComplex *B){
 
 
 void F_RF_update(
-    cublasHandle_t cublasH,
-    cuComplex* F_BB,
-    cuComplex* F,
-    cuComplex* F_RF,
-    int use){
+    cuDoubleComplex* F_BB,
+    cuDoubleComplex* F,
+    cuDoubleComplex* F_RF,
+    cuDoubleComplex* lambda,
+    double p,
+    int M,
+    int N,
+    int use,
+    cublasHandle_t cublasH){
 
-    int m = 32;
-    int n = 8;
+    cuDoubleComplex * A, *B, *C;
+    cudaMalloc((void**)&A, N*N*sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&B, M*N*sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&C, M*use*sizeof(cuDoubleComplex));
 
-    cuComplex * A, *B;
-    cudaMalloc((void**)&A, n*n*sizeof(cuComplex));
-    cudaMalloc((void**)&B, m*n*sizeof(cuComplex));
-
-    cuComplex alpha = {1.0,0.0};
-    cuComplex beta = {0.0,0.0};
-    cublasCgemm(
+    cuDoubleComplex alpha = {1.0,0.0};
+    cuDoubleComplex beta = {0.0,0.0};
+    cuDoubleComplex beta_p = {p,0.0};
+    cublasZgemm(
         cublasH,
         CUBLAS_OP_N,CUBLAS_OP_C,
-        n,n,use,
+        N,N,use,
         &alpha,
-        F_BB,n,
-        F_BB,n,
+        F_BB,N,
+        F_BB,N,
         &beta,
-        A,n
+        A,N
     );
-    cublasCgemm(
+    
+    cublasZgeam(
         cublasH,
-        CUBLAS_OP_N,CUBLAS_OP_C,
-        m,n,use,
+        CUBLAS_OP_N,CUBLAS_OP_N,
+        M,use,
         &alpha,
-        F,m,
-        F_BB,n,
-        &beta,
-        B,m
+        F,M,
+        &beta_p,
+        lambda,M,
+        C,M
     );
 
-    RF_update<<<m,m>>>(F_RF, A, B);
+    cublasZgemm(
+        cublasH,
+        CUBLAS_OP_N,CUBLAS_OP_C,
+        M,N,use,
+        &alpha,
+        C,M,
+        F_BB,N,
+        &beta,
+        B,M
+    );
+    //cuDoubleComplex test[1024];
+
+
+    RF_update<<<M,M>>>(F_RF, A, B, M, N);
+
+    // cudaMemcpy(test,F_RF,M*N*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // for(int i=0;i<4;i++){
+    //     printf("F_RF :%d: %f %f\n",i,test[i].x,test[i].y);
+    // }
 
 }
 
 //V_u V_d update
 
+
+
+
 __global__ void A_update(
-    cuComplex * A,
-    float N,
-    cuComplex * F,
-    float * p_u,
-    cuComplex * H_u,
-    cuComplex * H_SI,
-    cuComplex * I_W2B,
+    cuDoubleComplex * A,
+    double N,
+    cuDoubleComplex * F,
+    double * p_u,
+    cuDoubleComplex * H_u,
+    cuDoubleComplex * H_SI,
+    cuDoubleComplex * I_W2B,
     int use){
 
-    int k = blockIdx.x;
     int m = threadIdx.x;
     int n = threadIdx.y;
-
+    //<<<1,(M,M)>>>
     int M = 32;
 
-    __shared__ cuComplex A_s[1024];
-    if (k < use) {
-        cuComplex a;
-        a = cuCmulf(H_u[k*M+m], cuConjf(H_u[k*M+n]));
-        A_s[n*M+m] = cuCmulf(make_cuComplex(p_u[k], 0.0), a);
-    }
-    else if (k <= use*2) {
-        __shared__ cuComplex H_v[32];
-        int k_u = k - use;
-        if(m == 0 && n < M){
-            cuComplex a = {0.0,0.0};
+    __shared__ cuDoubleComplex A_s[1024];
+    __shared__ cuDoubleComplex H_v[32];
+
+    A_s[n*M+m] = {0.0,0.0};
+
+    for(int k=0;k<use;k++){
+        cuDoubleComplex a;
+        a = cuCmul(H_u[k*M+m], cuConj(H_u[k*M+n]));
+        a = cuCmul(make_cuDoubleComplex(p_u[k], 0.0), a);
+
+        // if( n==0 ){
+        //     printf("a :%d %d %e %e\n",k ,m,a.x,a.y);
+        // }
+        __syncthreads();
+        if(m == 0){
+            cuDoubleComplex aa = {0.0,0.0};
             for(int i=0; i<M; i++){
-                a = cuCaddf(a, cuCmulf(H_SI[i*M+n], F[k*M+i]));
+                aa = cuCadd(aa, cuCmul(H_SI[i*M+n], F[k*M+i]));
             }
-            H_v[n] = a;
+            H_v[n] = aa;
+
+            // printf("a :%d %d %e %e\n",k ,n,H_v[n].x,H_v[n].y);
         }
         __syncthreads();
 
-        A_s[n*M+m] = cuCmulf(H_v[m],H_v[n]);
-    }
+        // if(n==0){
+        //     printf("A_s_pre %d :%e %e\n",k, A_s[n*M+m].x,A_s[n*M+m].y);
+        // }
+        a = cuCadd(a, A_s[n*M+m]);
+        A_s[n*M+m] = cuCadd(a, cuCmul(H_v[m],cuConj(H_v[n])));
+        // if(n==0){
+        //     printf("A_s %d :%e %e\n",k, A_s[n*M+m].x,A_s[n*M+m].y);
+        // }
+        __syncthreads();
 
-    atomicAdd(&A[n*M+m].x, A_s[n*M+m].x);
-    atomicAdd(&A[n*M+m].y, A_s[n*M+m].y);
-
-    if(k == 0){
-        A[n*M+m] = cuCaddf(A[n*M+m], I_W2B[n*M+m]);
-        if(m == n){
-            A[n*M+m] = cuCaddf(A[n*M+m], make_cuComplex(N, 0.0));
-        }
     }
+    __syncthreads();
+
+
+    A_s[n*M+m] = cuCadd(A_s[n*M+m], I_W2B[n*M+m]);
+    __syncthreads();
+    if(m == n){
+        A_s[n*M+m] = cuCadd(A_s[n*M+m], make_cuDoubleComplex(N, 0.0));
+    }
+    __syncthreads();
+    A[n*M+m] = A_s[n*M+m];
+
 }
 
+// __global__ void A_update(
+//     cuDoubleComplex * A,
+//     double N,
+//     cuDoubleComplex * F,
+//     double * p_u,
+//     cuDoubleComplex * H_u,
+//     cuDoubleComplex * H_SI,
+//     cuDoubleComplex * I_W2B,
+//     int use){
+
+//     int k = blockIdx.x;
+//     int m = threadIdx.x;
+//     int n = threadIdx.y;
+
+//     int M = 32;
+
+//     __shared__ cuDoubleComplex A_s[1024];
+//     if (k < use) {
+//         cuDoubleComplex a;
+//         a = cuCmul(H_u[k*M+m], cuConj(H_u[k*M+n]));
+//         A_s[n*M+m] = cuCmul(make_cuDoubleComplex(p_u[k], 0.0), a);
+//     }
+//     else if (k <= use*2) {
+//         __shared__ cuDoubleComplex H_v[32];
+//         int k_u = k - use;
+//         if(m == 0 && n < M){
+//             cuDoubleComplex a = {0.0,0.0};
+//             for(int i=0; i<M; i++){
+//                 a = cuCadd(a, cuCmul(H_SI[i*M+n], F[k_u*M+i]));
+//             }
+//             H_v[n] = a;
+//         }
+//         __syncthreads();
+
+//         A_s[n*M+m] = cuCmul(H_v[m],cuConj(H_v[n]));
+//     }
+
+//     atomicAdd(&A[n*M+m].x, A_s[n*M+m].x);
+//     atomicAdd(&A[n*M+m].y, A_s[n*M+m].y);
+
+//     if(k == 0){
+//         A[n*M+m] = cuCadd(A[n*M+m], I_W2B[n*M+m]);
+//         if(m == n){
+//             A[n*M+m] = cuCadd(A[n*M+m], make_cuDoubleComplex(N, 0.0));
+//         }
+//     }
+// }
+
+
+
 __global__ void a_update(
-    cuComplex * a,
-    float N,
-    cuComplex * H_V,
-    float * p_u,
-    cuComplex * H1,
-    float * I_W2U,
+    cuDoubleComplex * a,
+    double N,
+    cuDoubleComplex * H_V,
+    double * p_u,
+    cuDoubleComplex * H1,
+    double * I_W2U,
     int use){
     
     int m = threadIdx.x;
 
-    float a_f = 0;
+    double a_f = 0;
     for(int i=0;i<use;i++){
-        a_f += p_u[i] * pow(cuCabsf(H1[i*use+m]),2);
+        a_f += p_u[i] * pow(cuCabs(H1[i*use+m]),2);
     }
     
-    cuComplex aa;
-    aa = cuCaddf(make_cuComplex(N, 0.0), H_V[m*use+m]);
+    cuDoubleComplex aa;
+    aa = cuCadd(make_cuDoubleComplex(N, 0.0), H_V[m*use+m]);
     a_f = a_f + I_W2U[m];
-    a[m] = cuCaddf(aa, make_cuComplex(a_f, 0.0));
+    a[m] = cuCadd(aa, make_cuDoubleComplex(a_f, 0.0));
 
 }
 
 __global__ void B_update(
-    cuComplex * B,
-    cuComplex * H_u,
-    float * p_u){
+    cuDoubleComplex * B,
+    cuDoubleComplex * H_u,
+    double * p_u){
 
     int m = threadIdx.x;
     int n = threadIdx.y;
     int M = 32;
 
-    B[n*M+m] = cuCmulf(H_u[n*M+m],make_cuComplex(sqrt(p_u[n]),0.0));
+    B[n*M+m] = cuCmul(H_u[n*M+m],make_cuDoubleComplex(sqrt(p_u[n]),0.0));
 
 
 }
 
 __global__ void VE_update(
-    cuComplex * v_u,
-    cuComplex * v_d,
-    cuComplex * A,
-    cuComplex * A_inv,
-    cuComplex * B,
-    cuComplex * a,
-    cuComplex * b,
-    float * e_u,
-    float * e_d,
+    cuDoubleComplex * v_u,
+    cuDoubleComplex * v_d,
+    cuDoubleComplex * A,
+    cuDoubleComplex * A_inv,
+    cuDoubleComplex * B,
+    cuDoubleComplex * a,
+    cuDoubleComplex * b,
+    double * e_u,
+    double * e_d,
     int use){
     int k = blockIdx.x;
     int m = threadIdx.x;
     int n = threadIdx.y;
     int M = 32;
-
+    __shared__ cuDoubleComplex v_u_l[32];
+    if(n == 0)
+        v_u_l[m] = {0.0,0.0};
+    __syncthreads();
     if(k < use){
-        __shared__ cuComplex v_u_l[32];
         if(m == 0){
-            cuComplex vv = {0.0,0.0};
+            cuDoubleComplex vv = {0.0,0.0};
             for(int i=0;i<M;i++){
-                vv = cuCaddf(vv, cuCmulf(A_inv[i*M+n], B[k*M+i]));
+                vv = cuCadd(vv, cuCmul(A_inv[i*M+n], B[k*M+i]));
             }
             v_u_l[n] = vv;
             v_u[k*M+n] = vv;
         }
         __syncthreads();
 
-        __shared__ float E_u[1024];
-        E_u[n*M+m] = cuCmulf(cuConjf(v_u_l[m]), cuCmulf(A[n*M+m], v_u_l[n])).x;
+        __shared__ double E_u[1024];
+        E_u[n*M+m] = 0.0;
+        E_u[n*M+m] = cuCmul(cuConj(v_u_l[m]), cuCmul(A[n*M+m], v_u_l[n])).x;
 
         __syncthreads();
 
         if(m == 0){
-            E_u[n*M+m] = E_u[n*M+m] - 2 * cuCmulf(cuConjf(v_u_l[n]), B[k*M+n]).x;
+            E_u[n*M+m] = E_u[n*M+m] - 2 * cuCmul(cuConj(v_u_l[n]), B[k*M+n]).x;
         }
         __syncthreads();
 
@@ -769,51 +905,68 @@ __global__ void VE_update(
         }
 
         __syncthreads();
-        e_u[k] = E_u[0] + 1.0;
+        if(n==0&&m==0)
+            e_u[k] = E_u[0] + 1.0;
     }
     else if(k < use*2){
         if(m == 0 && n == 0){
-            cuComplex v_dd;
-            v_dd = cuCdivf(b[k*use+k], a[k]);
-            v_d[k] = v_dd;
-            e_d[k] = a[k].x * pow(cuCabsf(v_dd),2) - 2 * cuCmulf(v_dd,b[k*use+k]).x + 1;
+            int kk = k - use;
+            cuDoubleComplex v_dd;
+            v_dd = cuCdiv(b[kk*use+kk], a[kk]);
+            v_d[kk] = v_dd;
+            e_d[kk] = a[kk].x * pow(cuCabs(v_dd),2) - 2 * cuCmul(v_dd,b[kk*use+kk]).x + 1;
         }
     }
 
 }
 
 void V_update(
+    double N,
+    cuDoubleComplex * F,
+    double * p_u,
+    cuDoubleComplex * v_u,
+    cuDoubleComplex * v_d,
+    double * e_u,
+    double * e_d,
+    cuDoubleComplex * H_u,
+    cuDoubleComplex * H_SI,
+    cuDoubleComplex * H_d,
+    cuDoubleComplex * H1,
+    cuDoubleComplex * I_W2B,
+    double * I_W2U,
+    int use,
     cublasHandle_t cublasH,
-    float N,
-    cuComplex * F,
-    float * p_u,
-    cuComplex * v_u,
-    cuComplex * v_d,
-    float * e_u,
-    float * e_d,
-    cuComplex * H_u,
-    cuComplex * H_SI,
-    cuComplex * H_d,
-    cuComplex * H1,
-    cuComplex * I_W2B,
-    float * I_W2U,
-    int use){
+    cusolverDnHandle_t cusolverH){
     
     int M =32;
 
-    cuComplex *A,*B, *a, *b;
-    cudaMalloc((void**)&A, M*M*sizeof(cuComplex));
+    //test
+    //cuDoubleComplex test[1024];
+    //double test2[1024];
 
-    A_update<<<use*2, dim3(M,M)>>>(A, N, F, p_u, H_u, H_SI, I_W2B, use);
+    cuDoubleComplex *A,*B, *a, *b;
+    cudaMalloc((void**)&A, M*M*sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&B, M*use*sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&a, use*sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&b, use*sizeof(cuDoubleComplex));
 
-    cuComplex *H_F,*H_F_t;
-    cudaMalloc((void**)&H_F, use*use*sizeof(cuComplex));
-    cudaMalloc((void**)&H_F_t, use*use*sizeof(cuComplex));
+    A_update<<<1, dim3(M,M)>>>(A, N, F, p_u, H_u, H_SI, I_W2B, use);
 
-    cuComplex alpha = {1.0,0.0};
-    cuComplex beta = {0.0,0.0};
 
-    cublasCgemm(
+    // cudaMemcpy(test,A,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // for(int i=0;i<4;i++){
+    //     printf("A:%d :%e %e\n",i,test[i].x,test[i].y);
+    // }
+
+
+    cuDoubleComplex *H_F,*H_F_t;
+    cudaMalloc((void**)&H_F, use*use*sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&H_F_t, use*use*sizeof(cuDoubleComplex));
+
+    cuDoubleComplex alpha = {1.0,0.0};
+    cuDoubleComplex beta = {0.0,0.0};
+
+    cublasZgemm(
         cublasH,
         CUBLAS_OP_N,CUBLAS_OP_N,
         use,use,M,
@@ -823,7 +976,7 @@ void V_update(
         &beta,
         H_F,use
     );
-    cublasCgemm(
+    cublasZgemm(
         cublasH,
         CUBLAS_OP_N,CUBLAS_OP_C,
         use,use,use,
@@ -835,8 +988,13 @@ void V_update(
     );
 
     a_update<<<1,use>>>(a,N,H_F_t,p_u,H1,I_W2U,use);
+
     B_update<<<1,dim3(M,use)>>>(B,H_u,p_u);
-    cublasCgemm(
+
+    
+
+
+    cublasZgemm(
         cublasH,
         CUBLAS_OP_N,CUBLAS_OP_N,
         use,use,M,
@@ -847,30 +1005,84 @@ void V_update(
         b,use
     );
 
-    cuComplex * A_inv;
-    cudaMalloc((void**)&A_inv, M*M*sizeof(cuComplex));
-    //inv(A, A_inv, M);
+
+
+    cuDoubleComplex * A_inv,*AA;
+    cudaMalloc((void**)&A_inv, M*M*sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&AA, M*M*sizeof(cuDoubleComplex));
+    cudaMemcpy(AA,A,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToDevice);
+
+    inv(A, A_inv, M,cusolverH);
+    // cudaMemcpy(test,AA,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // for(int i=0;i<32;i++){
+    //     printf("A :%d: %f %f\n",i,test[i].x,test[i].y);
+    // }
+
+    // cudaMemcpy(test,A_inv,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // for(int i=0;i<32;i++){
+    //     printf("Ainv :%d: %f %f\n",i,test[i].x,test[i].y);
+    // }
     
-    VE_update<<<use*2, dim3(M,M)>>>(v_u, v_d, A, A_inv, B, a, b, e_u, e_d, use);
+    // cuDoubleComplex *e;
+    // cudaMalloc((void**)&e, M*M*sizeof(cuDoubleComplex));
+    // cublasZgemm(
+    //     cublasH,
+    //     CUBLAS_OP_N,CUBLAS_OP_N,
+    //     M,M,M,
+    //     &alpha,
+    //     AA,M,
+    //     A_inv,M,
+    //     &beta,
+    //     e,M
+    // );
+    // cudaMemcpy(test,e,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // for(int i=0;i<32;i++){
+    //     printf("E :%d: %f %f\n",i,test[i].x,test[i].y);
+    // }
+    
+
+
+
+    VE_update<<<use*2, dim3(M,M)>>>(v_u, v_d, AA, A_inv, B, a, b, e_u, e_d, use);
+
+    // cuDoubleComplex ff[1024], vd[4];
+    // double eu[4],ed[4];
+    // cudaMemcpy(ff,v_u,M*use*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // cudaMemcpy(vd,v_d,use*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // cudaMemcpy(eu,e_u,use*sizeof(double),cudaMemcpyDeviceToHost);
+    // cudaMemcpy(ed,e_d,use*sizeof(double),cudaMemcpyDeviceToHost);
+
+    // for(int i=0;i<4;i++){
+    //     printf("v_u :%d: %f %f\n",i,ff[i].x,ff[i].y);
+    // }
+
+    // for(int i=0;i<4;i++){
+    //     printf("e_u :%d: %f\n",i,eu[i]);
+    // }
+
+    cudaFree(A);
+
 }
 
 
 //计算f
 
 __global__ void f_cal( 
-    float * f,   
-    float * w_u,
-    float * w_d,
-    float * e_u,
-    float * e_d,
-    float F_norm,
-    int p,
-    int use){
+    double * f,   
+    double * w_u,
+    double * w_d,
+    double * e_u,
+    double * e_d,
+    double F_norm,
+    double p,
+    int use,
+    int use_norm){
     
     int m = threadIdx.x;
     int n = threadIdx.y;
 
-    __shared__ float sh[1024];
+    extern __shared__ double sh[];
+
     if(m == 0){
         sh[m*use+n] = w_u[n] * e_u[n];
     }
@@ -883,10 +1095,12 @@ __global__ void f_cal(
     else if (m == 3) {
         sh[m*use+n] = -1.0 * __log2f(w_d[n]);
     }
+    else
+        sh[m*use+n] = 0.0;
     __syncthreads();
 
     int tid = m*use+n;
-    for (int i = 2*use; i > 0; i >>= 1)
+    for (int i = 2*use_norm; i > 0; i >>= 1)
     {
         if(tid < i){
             sh[tid] = sh[tid] + sh[tid+i];
@@ -900,29 +1114,32 @@ __global__ void f_cal(
     
 }
 
-float F_cal(
-    cublasHandle_t cublasH,
-    float * w_u,
-    float * w_d,
-    float * e_u,
-    float * e_d,
-    cuComplex * F,
-    cuComplex * F_RF,
-    cuComplex * F_BB,
+double F_cal(
+    double * w_u,
+    double * w_d,
+    double * e_u,
+    double * e_d,
+    cuDoubleComplex * F,
+    cuDoubleComplex * F_RF,
+    cuDoubleComplex * F_BB,
+    cuDoubleComplex * lambda,
     int use,
-    int p,
-    int RF){
+    double p,
+    int RF,
+    cublasHandle_t cublasH,
+    int use_norm){
     
     int M = 32;
 
-    cuComplex * F_gap;
-    float F_norm;
-    cudaMalloc((void**)&F_gap, M*use*sizeof(cuComplex));
-    cudaMemcpy(F_gap, F, M*use*sizeof(cuComplex), cudaMemcpyDeviceToDevice);
-    cuComplex alpha = {-1.0,0.0};
-    cuComplex beta = {1.0,0.0};
+    cuDoubleComplex * F_gap;
+    double F_norm;
+    cudaMalloc((void**)&F_gap, M*use*sizeof(cuDoubleComplex));
+    cudaMemcpy(F_gap, F, M*use*sizeof(cuDoubleComplex), cudaMemcpyDeviceToDevice);
+    cuDoubleComplex alpha = {-1.0,0.0};
+    cuDoubleComplex beta = {1.0,0.0};
+    cuDoubleComplex beta_p = {p,0.0};
     
-    cublasCgemm(
+    cublasZgemm(
         cublasH,
         CUBLAS_OP_N,CUBLAS_OP_N,
         M,use,RF,
@@ -933,47 +1150,146 @@ float F_cal(
         F_gap,M
     );
 
-    cublasScnrm2(
+    cublasZgeam(
+        cublasH,
+        CUBLAS_OP_N,CUBLAS_OP_N,
+        M,use,
+        &beta,
+        F_gap,M,
+        &beta_p,
+        lambda,M,
+        F_gap,M
+    );
+
+    cublasDznrm2(
         cublasH, M*use,
         F_gap, 1, &F_norm
     );
-    float * f;
-    cudaMalloc((void **)&f,sizeof(float));
-    f_cal<<<1,dim3(4,use)>>>(f, w_u, w_d, e_u, e_d, F_norm, p, use);
+    double * f;
+    cudaMalloc((void **)&f,sizeof(double));
+    f_cal<<<1,dim3(use_norm,use),use_norm*use>>>(f, w_u, w_d, e_u, e_d, F_norm, p, use,use_norm);
 
-    float f_h;
-    cudaMemcpy(&f_h, f, sizeof(float), cudaMemcpyDeviceToHost);
+    double f_h;
+    cudaMemcpy(&f_h, f, sizeof(double), cudaMemcpyDeviceToHost);
     return f_h;
 
 }
 
 
-// int main() {
 
-//     double e_u[ 4 ] = { 1,2,3,4 };
-//     double e_d[ 4 ] = { 1,2,3,4 };
+//cv_cal
 
-//     int ul_use = 4;
+__global__ void norm_Inf(cuDoubleComplex * A,int M, int N,double * res ){
+    int m = threadIdx.x; 
+    int n = threadIdx.y;
 
-//     double* e_u_d, * e_d_d;
-//     cudaMalloc((void**)&e_d_d, 4 * sizeof(double));
-//     cudaMalloc((void**)&e_u_d, 4 * sizeof(double));
+    int len = M*N;
+    int idx = m*16+n;
+    __shared__ double A_s[512];
+    if(idx < len){
+        A_s[idx] = cuCabs(A[idx]);
+    }
+    else{
+        A_s[idx] = 0.0f;
+    }
+    __syncthreads();
 
-//     cudaMemcpy(e_u_d, e_u, ul_use * sizeof(double), cudaMemcpyHostToDevice);
-//     cudaMemcpy(e_d_d, e_d, ul_use * sizeof(double), cudaMemcpyHostToDevice);
+    for (int i = 256; i > 0; i >>= 1)
+    {
+        if(idx < i)
+            A_s[idx] = max(A_s[idx],A_s[idx+i]);
+        /* code */
+        __syncthreads();
+    }
+    __syncthreads();
+
+    res[0] = A_s[0];
+        
+}
 
 
-//     double* sigma_u, * sigma_d;
-//     cudaMalloc((void**)&sigma_u, 4 * sizeof(double));
-//     cudaMalloc((void**)&sigma_d, ul_use * sizeof(double));
+double cv_cal(
+    cuDoubleComplex * F,
+    cuDoubleComplex * F_RF,
+    cuDoubleComplex * F_BB,
+    int M,
+    int RF,
+    int use,
+    cublasHandle_t cublasH,
+    int use_norm){
+    
+    cuDoubleComplex * A;
+    cudaMalloc((void**)&A,M*use*sizeof(cuDoubleComplex));
+    cudaMemcpy(A,F,M*use*sizeof(cuDoubleComplex),cudaMemcpyHostToHost);
 
-//     printf("%f", e_u[ 0 ]);
+    cuDoubleComplex alpha = {-1.0,0.0};
+    cuDoubleComplex beta = {1.0,0.0};
 
-//     dim3 blocksize(1, 1, 8);
-//     w_updata << < 1, blocksize >> > (sigma_u, sigma_d, e_u_d, e_d_d, ul_use);
-//     cudaDeviceSynchronize();
+    cublasZgemm(
+        cublasH,
+        CUBLAS_OP_N,CUBLAS_OP_N,
+        M,use,RF,
+        &alpha,
+        F_RF, M,
+        F_BB, RF,
+        &beta,
+        A,M
+    );
+
+    double * inf_norm;
+    cudaMalloc((void**)&inf_norm,sizeof(double));
+
+    norm_Inf<<<1,dim3(M,16)>>>(A, M, use, inf_norm);
+
+    double cv;
+    cudaMemcpy(&cv,inf_norm,sizeof(double),cudaMemcpyDeviceToHost);
+    return cv;
+
+}
 
 
+void lambda_update(
+    cuDoubleComplex * F,
+    cuDoubleComplex * F_RF,
+    cuDoubleComplex * F_BB,
+    cuDoubleComplex * lambda,
+    double p,
+    int M,
+    int RF,
+    int use,
+    cublasHandle_t cublasH){
 
-//     return 0;
-// }
+    cuDoubleComplex * A;
+    cudaMalloc((void**)&A,M*use*sizeof(cuDoubleComplex));
+    cudaMemcpy(A,F,M*use*sizeof(cuDoubleComplex),cudaMemcpyHostToHost);
+
+    cuDoubleComplex alpha = {-1.0,0.0};
+    cuDoubleComplex beta = {1.0,0.0};
+    cuDoubleComplex beta_p = {1/p,0.0};
+    cublasZgemm(
+        cublasH,
+        CUBLAS_OP_N,CUBLAS_OP_N,
+        M,use,RF,
+        &alpha,
+        F_RF, M,
+        F_BB, RF,
+        &beta,
+        A,M
+    );
+    cublasZgeam(
+        cublasH,
+        CUBLAS_OP_N,CUBLAS_OP_N,
+        M,use,
+        &beta,
+        lambda,M,
+        &beta_p,
+        A,M,
+        lambda,M
+    );
+
+    // cuDoubleComplex test[1024];
+    // cudaMemcpy(test,lambda,M*use*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    // for(int i=0;i<32;i++){
+    //     printf("lambda :%d: %e %e\n",i,test[i].x,test[i].y);
+    // }
+}

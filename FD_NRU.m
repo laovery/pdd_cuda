@@ -119,11 +119,19 @@ function [SE,R_u,R_d,I_SI,I_user]=FD_NRU(user_num,n_BS,RF,beta,alphe,temp)
     %[SE1,R_u1,R_d1] = PDD_pro(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,I,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U)
     %[SE2,~] = FD_ZFBF(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,p_user,p_BS,n_BS,I,I_W2B,I_W2U);
     %[SE3,~] = PDD_HD(ul_user,dl_user,H_u,H_d,H2,H3,N,I,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U);
-    %[SE4,R_u,R_d] = PDD_pro(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,I,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U);
-    %[SE5,~] = PDD_max(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U);
-    [SE5,R_u5,R_d5] = PDD_original(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,I,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U,alphe,temp);
+    %[SE4,se_d3,R_u,R_d] = PDD_pro(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,I,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U);
+    %[SE5,se_d3,~] = PDD_max(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U);
+    tic
+    
+    [SE5,SE_d1,R_u5,R_d5] = PDD_original(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,I,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U,alphe,temp);
+    elapsedTime = toc;
+    disp(['代码执行时间：', num2str(elapsedTime), '秒']);
+    disp(SE5);
+    [SE6,SE_d2,~] = PDD_cu(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,I,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U,alphe,temp);
+
     %SE=[0,0,0,0];
-    SE=[SE5];
+    %se_d = [SE_d1;SE_d2];
+    SE=[SE5,SE6];
 %     I=0;R_u=0;R_d=0;
 %     I=[I1,I2,I3,I4];
 %    SE3=0;

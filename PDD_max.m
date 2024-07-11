@@ -1,4 +1,4 @@
-function [sum_SE,R_u,R_d] = PDD_max(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U)
+function [sum_SE,SE,R_u,R_d] = PDD_max(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U)
     p_u=zeros(1,ul_user); %tx power single-antenna 
     V=zeros(m_BS,dl_user);V_RF=matrix_initiation(m_BS,RF);V_BB=zeros(RF,dl_user);%beam matirx at gNB
     %W=pinv(H_u)';

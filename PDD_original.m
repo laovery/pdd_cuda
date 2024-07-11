@@ -1,4 +1,4 @@
-function [sum_SE,r_u,r_d,I_SI,I_user] = PDD_original(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,I,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U,alphe,temp)
+function [sum_SE,SE,r_u,r_d,I_SI,I_user] = PDD_original(ul_user,dl_user,H_SI,H_u,H_d,H1,H2,H3,N,I,p_user,p_BS,m_BS,n_BS,RF,n_user,I_W2B,I_W2U,alphe,temp)
     I_th=I/(2*ul_user);
     p_u=zeros(1,ul_user); %tx power single-antenna 
     V=zeros(m_BS,dl_user);V_RF=matrix_initiation(m_BS,RF);V_BB=zeros(RF,dl_user);%beam matirx at gNB
@@ -111,6 +111,7 @@ function [sum_SE,r_u,r_d,I_SI,I_user] = PDD_original(ul_user,dl_user,H_SI,H_u,H_
             end
             inner=inner+1;
             
+            
         end
 
         delta=c2;
@@ -167,6 +168,7 @@ function [sum_SE,r_u,r_d,I_SI,I_user] = PDD_original(ul_user,dl_user,H_SI,H_u,H_
         
         r_u=sum(R_u);
         r_d=sum(R_d);
+        %[r_u,r_d] = cal_e(ul_user,dl_user,n_BS,N,p_u,V,V_RF,V_BB,H_SI,H_u,H_d,H1,I_W2B,I_W2U);
         CV(outer)=cv;
         SE(outer)=r_u+r_d;
         outer=outer+1;

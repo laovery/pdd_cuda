@@ -1,6 +1,9 @@
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <mex.h>
 #include <cublas_v2.h>
+#include <cusolverDn.h>
 #include <cuda_runtime.h>
 #include <cuComplex.h>
 #include "cu_pdd.h"
@@ -73,7 +76,6 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     double * lambda = mxGetPr(prhs[23]);
     double * e_u = mxGetPr(prhs[24]);
     double * e_d = mxGetPr(prhs[25]);
-    
 
 
     cuDoubleComplex * H_si = init_mat(H_si_r,H_si_i,mxGetN(prhs[2])*mxGetM(prhs[2]));
@@ -92,14 +94,18 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
 
 
 
-    double *I_W2U_d, *p_u_d, *e_u_d, *e_d_d;
-    cuDoubleComplex * H_si_d, *H_u_d, *H_d_d, *H1_d, *H2_d, *H3_d, *I_W2B_d, *F_d, *F_RF_d, *F_BB_d, *v_u_d, *v_d_d;
+    double *I_W2U_d, *p_u_d, *e_u_d, *e_d_d, *A;
+    cuDoubleComplex * H_si_d, *H_u_d, *H_d_d, *H1_d, *H2_d, *H3_d, *I_W2B_d, *F_d, *F_RF_d, *F_BB_d, *v_u_d, *v_d_d,*lambda_d;
 
 
     //转移到gpu上
     cudaMalloc((void **)&e_d_d, use*sizeof(double));
     cudaMalloc((void **)&e_u_d, use*sizeof(double));
     cudaMalloc((void **)&p_u_d, use*sizeof(double));
+    cudaMalloc((void **)&I_W2U_d, use*sizeof(double));
+    cudaMalloc((void **)&A, use*sizeof(double));
+
+
     cudaMalloc((void **)&v_u_d, m_BS*use*sizeof(cuDoubleComplex));
     cudaMalloc((void **)&v_d_d, use*sizeof(cuDoubleComplex));
     cudaMalloc((void **)&F_d, m_BS*use*sizeof(cuDoubleComplex));
@@ -112,6 +118,9 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     cudaMalloc((void **)&H1_d, use*use*sizeof(cuDoubleComplex));
     cudaMalloc((void **)&H2_d, m_BS*sizeof(cuDoubleComplex));
     cudaMalloc((void **)&H3_d, use*sizeof(cuDoubleComplex));
+    cudaMalloc((void **)&I_W2B_d, m_BS*m_BS*sizeof(cuDoubleComplex));
+    cudaMalloc((void **)&lambda_d, m_BS*use*sizeof(cuDoubleComplex));
+
 
 
 
@@ -123,8 +132,12 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     cudaMemcpy(H1_d,H1,use*use*sizeof(cuDoubleComplex),cudaMemcpyHostToDevice);
     cudaMemcpy(H2_d,H2,m_BS*sizeof(cuDoubleComplex),cudaMemcpyHostToDevice);
     cudaMemcpy(H3_d,H3,use*sizeof(cuDoubleComplex),cudaMemcpyHostToDevice);
+    cudaMemcpy(H3_d,H3,use*sizeof(cuDoubleComplex),cudaMemcpyHostToDevice);
+    cudaMemcpy(I_W2B_d,I_W2B,m_BS*m_BS*sizeof(cuDoubleComplex),cudaMemcpyHostToDevice);
+    cudaMemcpy(I_W2U_d,I_W2U,use*sizeof(double),cudaMemcpyHostToDevice);
+
     
-    //更新参数赋值，之后删除
+    //更新参数赋值
     cudaMemcpy(e_u_d,e_u,use*sizeof(double),cudaMemcpyHostToDevice);
     cudaMemcpy(e_d_d,e_d,use*sizeof(double),cudaMemcpyHostToDevice);
   
@@ -133,16 +146,14 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     cudaMemcpy(F_BB_d,F_BB,RF*use*sizeof(cuDoubleComplex),cudaMemcpyHostToDevice);
     cudaMemcpy(v_u_d,v_u,use*m_BS*sizeof(cuDoubleComplex),cudaMemcpyHostToDevice);
     cudaMemcpy(v_d_d,v_d,use*sizeof(cuDoubleComplex),cudaMemcpyHostToDevice);
-
-
-
+    //cudaMemcpy(p_u_d,p_u,use*sizeof(double),cudaMemcpyHostToDevice);
+    cuDoubleComplex lam[1024] = {0.0,0.0};
+    cudaMemcpy(lambda_d, lam, m_BS * use * sizeof(cuDoubleComplex),cudaMemcpyHostToDevice);
 
     double * w_u_d, * w_d_d;
     cudaMalloc((void**)&w_u_d,use * sizeof(double));
     cudaMalloc((void**)&w_d_d,use * sizeof(double));
 
-
-    cuDoubleComplex h_si[16];
 
 
     //初始化参数
@@ -152,50 +163,178 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[])
     double s1 = 0.8, c1 = 1E-4, c2 = 1E-2, c3 = 1E-3;
     double cv = c1, delta = c2;
 
-    w_update<<<1,use*2>>>(w_u_d,w_d_d,e_u_d,e_d_d,use);
+    int use_norm = 8;
+
+    cublasHandle_t cublasH;
+    cublasCreate(&cublasH);
+
+    cusolverDnHandle_t cusolverH = NULL;
+    cusolverDnCreate(&cusolverH);
+    //统计时间
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);  // 记录开始时间
+
+    while(cv >= c1){
+        int inner = 0;
+        double f[30] = {0.0};
+        while (delta >= c2 && inner < 30) {
+
+            w_update<<<1,use*2>>>(w_u_d,w_d_d,e_u_d,e_d_d,A,use);
+
+            //double ww[6];
+            // cudaMemcpy(ww,w_u_d,use*sizeof(double),cudaMemcpyDeviceToHost);
+            // for(int i=0;i<use;i++){
+            //     printf("%e\n",ww[i]);
+            // }
+
+            p_update<<<dim3(use, use),m_BS>>>(p_u_d, w_u_d,w_d_d, v_u_d, v_d_d,H_u_d, H1_d, H3_d, A, I_th, m_BS, use);
 
 
-    double ww[4];
-    cudaMemcpy(ww,w_u_d,use*sizeof(double),cudaMemcpyDeviceToHost);
-    for(int i=0;i<use;i++){
-        printf("%f\n",ww[i]);
-    }
+            // cudaMemcpy(ww,p_u_d,use*sizeof(double),cudaMemcpyDeviceToHost);
+            // for(int i=0;i<use;i++){
+            //     printf("%e\n",ww[i]);
+            // }
 
-    cuDoubleComplex * A;
-    p_update<<<dim3(use, use),m_BS>>>(p_u_d, w_u_d,w_d_d, v_u_d, v_d_d,
-                                                                        H_u_d, H1_d, H3_d, I_th, m_BS, use);
+            F_update(F_d,F_RF_d,F_BB_d,v_u_d,v_d_d,w_u_d,w_d_d,H_d_d,H_si_d,H1_d,lambda_d,p,m_BS,use,cublasH,cusolverH);
 
-    double pp[4];
-    cudaMemcpy(pp,p_u_d,use*sizeof(double),cudaMemcpyDeviceToHost);
-    for(int i=0;i<use;i++){
-        printf("%f\n",pp[i]);
-    }
+            F_BB_update(F_RF_d,F_d,F_BB_d,lambda_d,p,m_BS,RF,use,cublasH,cusolverH);
 
+            F_RF_update(F_BB_d,F_d,F_RF_d,lambda_d,p,m_BS,RF,use,cublasH);
+            
+            V_update(N,F_d,p_u_d,v_u_d,v_d_d,e_u_d,e_d_d,H_u_d,H_si_d,H_d_d,H1_d,I_W2B_d,I_W2U_d,use,cublasH,cusolverH);
 
+            f[inner] = F_cal(w_u_d,w_d_d,e_u_d,e_d_d,F_d,F_RF_d,F_BB_d,lambda_d,use,p,RF,cublasH,use_norm);
 
-    A = F_update(F_d,F_RF_d,F_BB_d,v_u_d,v_d_d,w_u_d,w_d_d,H_d_d,H_si_d,H1_d,p,m_BS,use);
+            //printf("%e\n",f[inner]);
 
-    cuDoubleComplex test3[1024];
-    cudaMemcpy(test3,A,m_BS*m_BS*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+            if(inner >= 1)
+                delta = fabs((f[inner] - f[inner-1]) / f[inner]);
 
-
-    plhs[0] = mxCreateDoubleMatrix(m_BS,m_BS, mxCOMPLEX);
-    double *real = mxGetPr(plhs[0]);
-    double *imag = mxGetPi(plhs[0]);
-
-    for (int i=0; i<32; i++) {
-        for (int j=0; j<32; j++) {
-            real[i*m_BS+j] = (double)test3[i*m_BS+j].x;
-            imag[i*m_BS+j] = (double)test3[i*m_BS+j].y;
-
+            inner+=1;
         }
+
+        delta = c2;
+
+        cv = cv_cal(F_d,F_RF_d,F_BB_d,m_BS,RF,use,cublasH,use_norm);
+
+        //printf("%e\n",cv);
+
+        if(cv > c3)
+            p = s1 * p;
+        else{
+            //printf("lambda_update!!!\n");
+            lambda_update(F_d,F_RF_d,F_BB_d,lambda_d,p,m_BS,RF,use,cublasH);
+            c3 = s1 * cv;
+        }
+        //printf("%e %e\n",cv,c1);
     }
-    // cuComplex ff[128];
-    // cudaMemcpy(ff,F_d,m_BS*use*sizeof(cuComplex),cudaMemcpyDeviceToHost);
 
-    // for(int i=0;i<32;i++){
-    //     printf("%d: %f %f\n",i,ff[i].x,ff[i].y);
-    // }
+    cudaDeviceSynchronize();
+
+    cudaEventRecord(stop);   // 记录结束时间
+    cudaEventSynchronize(stop); // 等待事件完成
+
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop); // 计算时间差
+
+    printf("run time: %0.4fms\n", milliseconds);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
 
+    plhs[0] = mxCreateDoubleMatrix(1,use,mxREAL);
+    plhs[1] = mxCreateDoubleMatrix(m_BS,use,mxCOMPLEX);
+    plhs[2] = mxCreateDoubleMatrix(m_BS,RF,mxCOMPLEX);
+    plhs[3] = mxCreateDoubleMatrix(RF,use,mxCOMPLEX);
+    plhs[4] = mxCreateDoubleMatrix(1,use,mxREAL);
+    plhs[5] = mxCreateDoubleMatrix(1,use,mxREAL);
+    plhs[6] = mxCreateDoubleMatrix(m_BS,use,mxCOMPLEX);
+    plhs[7] = mxCreateDoubleMatrix(use,1,mxCOMPLEX);
+
+
+
+    double * p_u_out = mxGetPr(plhs[0]);
+    double * V_r_out = mxGetPr(plhs[1]);
+    double * V_i_out = mxGetPi(plhs[1]);
+    double * V_RF_r_out = mxGetPr(plhs[2]);
+    double * V_RF_i_out = mxGetPi(plhs[2]);
+    double * V_BB_r_out = mxGetPr(plhs[3]);
+    double * V_BB_i_out = mxGetPi(plhs[3]);
+    double * e_u_out = mxGetPr(plhs[4]);
+    double * e_d_out = mxGetPr(plhs[5]);
+    double * v_u_r_out = mxGetPr(plhs[6]);
+    double * v_u_i_out = mxGetPi(plhs[6]);
+    double * v_d_r_out = mxGetPr(plhs[7]);
+    double * v_d_i_out = mxGetPi(plhs[7]);
+
+    double p_u_h[use],e_u_h[use],e_d_h[use];
+    cuDoubleComplex V_h[m_BS*use];
+    cuDoubleComplex V_RF_h[m_BS*RF];
+    cuDoubleComplex V_BB_h[RF*use];
+    cuDoubleComplex v_u_h[m_BS*use];
+    cuDoubleComplex v_d_h[use];
+
+
+    cudaMemcpy(p_u_h,p_u_d,use*sizeof(double),cudaMemcpyDeviceToHost);
+    cudaMemcpy(e_u_h,e_u_d,use*sizeof(double),cudaMemcpyDeviceToHost);
+    cudaMemcpy(e_d_h,e_d_d,use*sizeof(double),cudaMemcpyDeviceToHost);
+    
+    
+    cudaMemcpy(V_h,F_d,use*m_BS*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    cudaMemcpy(V_RF_h,F_RF_d,m_BS*RF*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    cudaMemcpy(V_BB_h,F_BB_d,RF*use*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    cudaMemcpy(v_u_h,v_u_d,use*m_BS*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+    cudaMemcpy(v_d_h,v_d_d,use*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
+
+
+    for(int i=0;i<use;i++){
+        p_u_out[i] = p_u_h[i];
+    }
+    for(int i=0;i<use;i++){
+        e_u_out[i] = e_u_h[i];
+    }
+    for(int i=0;i<use;i++){
+        e_d_out[i] = e_d_h[i];
+    }
+
+    for (int i = 0; i < use*m_BS; i++)
+    {
+        V_r_out[i] = V_h[i].x;
+        V_i_out[i] = V_h[i].y;
+        /* code */
+    }
+    for (int  i = 0; i < m_BS*RF; i++)
+    {
+        V_RF_r_out[i] = V_RF_h[i].x;
+        V_RF_i_out[i] = V_RF_h[i].y;
+        /* code */
+    }
+    for (int  i = 0; i < use*RF; i++)
+    {
+        V_BB_r_out[i] = V_BB_h[i].x;
+        V_BB_i_out[i] = V_BB_h[i].y;
+        /* code */
+    }
+    for (int i = 0; i < use*m_BS; i++)
+    {
+        v_u_r_out[i] = v_u_h[i].x;
+        v_u_i_out[i] = v_u_h[i].y;
+        /* code */
+    }
+    for (int i = 0; i < use; i++)
+    {
+        v_d_r_out[i] = v_d_h[i].x;
+        v_d_i_out[i] = v_d_h[i].y;
+        /* code */
+    }
+    
+
+    cublasDestroy(cublasH);
+    cusolverDnDestroy(cusolverH);
+    cudaDeviceReset();
 }

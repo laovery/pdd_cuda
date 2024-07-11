@@ -2,7 +2,7 @@
 #define CU_PDD_H
 
 
-__global__ void w_update(double * w_u, double * w_d , double * e_u,double * e_d,int size);
+__global__ void w_update(double * w_u, double * w_d , double * e_u,double * e_d,double * A,int size);
 
 __global__ void p_update(
     double* p_u, 
@@ -13,11 +13,12 @@ __global__ void p_update(
     cuDoubleComplex* H_u,
     cuDoubleComplex* H1, 
     cuDoubleComplex* H3,
+    double* A,
     double I_th,
     int M,
     int use);
 
-cuDoubleComplex * F_update(
+void F_update(
     cuDoubleComplex * F, 
     cuDoubleComplex * F_RF,
     cuDoubleComplex * F_BB,
@@ -28,56 +29,92 @@ cuDoubleComplex * F_update(
     cuDoubleComplex * H_d,
     cuDoubleComplex * H_SI,
     cuDoubleComplex * H1,
+    cuDoubleComplex * lambda,
     double p,
     int M,
-    int use);
+    int use,
+    cublasHandle_t cublasH,
+    cusolverDnHandle_t cusolverH);
 
-// void F_BB_update(
-//     cuDoubleComplex * F_RF,
-//     cuDoubleComplex * F,
-//     cuDoubleComplex * F_BB,
-//     int use);
+void F_BB_update(
+    cuDoubleComplex * F_RF,
+    cuDoubleComplex * F,
+    cuDoubleComplex * F_BB,
+    cuDoubleComplex * lambda,
+    double p,
+    int M,
+    int N,
+    int use,
+    cublasHandle_t cublasH,
+    cusolverDnHandle_t cusolverH);
 
-// void F_RF_update(
-//     cublasHandle_t cublasH,
-//     cuDoubleComplex* F_BB,
-//     cuDoubleComplex* F,
-//     cuDoubleComplex* F_RF,
-//     int use);
+void F_RF_update(
+    cuDoubleComplex* F_BB,
+    cuDoubleComplex* F,
+    cuDoubleComplex* F_RF,
+    cuDoubleComplex* lambda,
+    double p,
+    int M,
+    int N,
+    int use,
+    cublasHandle_t cublasH);
 
-// void V_update(
-//     cublasHandle_t cublasH,
-//     double N,
-//     cuDoubleComplex * F,
-//     double * p_u,
-//     cuDoubleComplex * v_u,
-//     cuDoubleComplex * v_d,
-//     double * e_u,
-//     double * e_d,
-//     cuDoubleComplex * H_u,
-//     cuDoubleComplex * H_SI,
-//     cuDoubleComplex * H_d,
-//     cuDoubleComplex * H1,
-//     cuDoubleComplex * I_W2B,
-//     double * I_W2U,
-//     int use);
+void V_update(
+    double N,
+    cuDoubleComplex * F,
+    double * p_u,
+    cuDoubleComplex * v_u,
+    cuDoubleComplex * v_d,
+    double * e_u,
+    double * e_d,
+    cuDoubleComplex * H_u,
+    cuDoubleComplex * H_SI,
+    cuDoubleComplex * H_d,
+    cuDoubleComplex * H1,
+    cuDoubleComplex * I_W2B,
+    double * I_W2U,
+    int use,
+    cublasHandle_t cublasH,
+    cusolverDnHandle_t cusolverH);
 
-// void inv(cuDoubleComplex * F, cuDoubleComplex * F_inv, int M);
 
-// double F_cal(
-//     cublasHandle_t cublasH,
-//     double * w_u,
-//     double * w_d,
-//     double * e_u,
-//     double * e_d,
-//     cuDoubleComplex * F,
-//     cuDoubleComplex * F_RF,
-//     cuDoubleComplex * F_BB,
-//     int use,
-//     int p,
-//     int RF);
+
+double F_cal(
+    double * w_u,
+    double * w_d,
+    double * e_u,
+    double * e_d,
+    cuDoubleComplex * F,
+    cuDoubleComplex * F_RF,
+    cuDoubleComplex * F_BB,
+    cuDoubleComplex * lambda,
+    int use,
+    double p,
+    int RF,
+    cublasHandle_t cublasH,
+    int use_norm);
  
 
+double cv_cal(
+    cuDoubleComplex * F,
+    cuDoubleComplex * F_RF,
+    cuDoubleComplex * F_BB,
+    int M,
+    int RF,
+    int use,
+    cublasHandle_t cublasH,
+    int use_norm);
 
+
+void lambda_update(
+    cuDoubleComplex * F,
+    cuDoubleComplex * F_RF,
+    cuDoubleComplex * F_BB,
+    cuDoubleComplex * lambda,
+    double p,
+    int M,
+    int RF,
+    int use,
+    cublasHandle_t cublasH);
 
 #endif 

@@ -190,6 +190,37 @@ __global__ void fun4(int c){
 
 }
 
+__global__ void norm_Inf(cuDoubleComplex * A,int M, int N,int use_norm,double * res ){
+    int m = threadIdx.x; 
+    int n = threadIdx.y;
+
+    int len = M*N;
+    int idx = m*use_norm+n;
+    extern __shared__ double A_s[];
+    if(idx < len){
+        //printf("%d  = %f %f\n",idx,A_s[idx]);
+
+        A_s[idx] = cuCabs(A[idx]);
+        printf("%d  = %f\n",idx,A_s[idx]);
+    }
+    else{
+        A_s[idx] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int i = M*use_norm/2; i > 0; i >>= 1)
+    {
+        if(idx < i)
+            A_s[idx] = max(A_s[idx],A_s[idx+i]);
+        /* code */
+        __syncthreads();
+    }
+    __syncthreads();
+
+    res[0] = A_s[0];
+        
+}
+
 int main() {
 
     float *f ;
@@ -197,15 +228,20 @@ int main() {
     int use = 4;
 
     
-    std::vector<cuComplex> A_h = {
+    std::vector<cuDoubleComplex> A_h = {
         {1,0},{2, -3},{3,-5},
-        {2, 1}};
+        {2, 1},{5,2},{3,1}};
     float e_u[ 4 ] = { 1,2,3,4 };
     float e_d[ 4 ] = { 2,2,2,2 };
     std::vector<cuComplex> B_h = {
         {1,0},{2,-3},{3,-5},
         {2,3}};
     int ul_use = 4;
+
+    cuDoubleComplex * a_d, * b_d, * c_d, * B_d;
+    cudaMalloc((void**)&a_d,6*sizeof(cuDoubleComplex));
+    cudaMalloc((void**)&c_d,6*sizeof(cuDoubleComplex));
+    cudaMemcpy(a_d, A_h.data(), 6* sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
 
     float* e_u_d, * e_d_d;
     cudaMalloc((void**)&e_d_d, 4 * sizeof(float));
@@ -214,7 +250,15 @@ int main() {
     cudaMemcpy(e_u_d, e_u, ul_use * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(e_d_d, e_d, ul_use * sizeof(float), cudaMemcpyHostToDevice);
 
+    double * inf_norm;
+    cudaMalloc((void**)&inf_norm,sizeof(double));
 
+
+
+    norm_Inf<<<1,dim3(2,4),2*4>>>(a_d,2,3,4,inf_norm);
+    double cv;
+    cudaMemcpy(&cv,inf_norm,sizeof(double),cudaMemcpyDeviceToHost);
+    printf("%f\n",cv);
     //fun4<<<1,1>>>(1);
 
 
@@ -233,32 +277,32 @@ int main() {
     //     printf("%f : %f %f\n",e_u[i],w_u[i],w_d[i]);
     // }
 
-    int M = 32;
-    cuDoubleComplex * a_d, * b_d, * c_d, * B_d;
-    cudaMalloc((void**)&a_d,M*M*sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&c_d,M*M*sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&B_d,M*M*sizeof(cuDoubleComplex));
-    cudaMalloc((void**)&b_d, M*M*sizeof(cuDoubleComplex));
+    // int M = 32;
+    // cuDoubleComplex * a_d, * b_d, * c_d, * B_d;
+    // cudaMalloc((void**)&a_d,M*M*sizeof(cuDoubleComplex));
+    // cudaMalloc((void**)&c_d,M*M*sizeof(cuDoubleComplex));
+    // cudaMalloc((void**)&B_d,M*M*sizeof(cuDoubleComplex));
+    // cudaMalloc((void**)&b_d, M*M*sizeof(cuDoubleComplex));
 
-    std::ifstream file("x.txt");
+    // std::ifstream file("x.txt");
 
-    cuDoubleComplex A[1024];
+    // cuDoubleComplex A[1024];
 
-    for(int i=0;i<M;i++){
-        for(int j=0;j<M;j++){
-            double x,y;
-            char c1,c2;
-            file >> x >> c1 >>y>>c2;
-            A[j*M+i] = make_cuDoubleComplex(x, y);
-        }
-    }
-    file.close();
+    // for(int i=0;i<M;i++){
+    //     for(int j=0;j<M;j++){
+    //         double x,y;
+    //         char c1,c2;
+    //         file >> x >> c1 >>y>>c2;
+    //         A[j*M+i] = make_cuDoubleComplex(x, y);
+    //     }
+    // }
+    // file.close();
 
-    for (int i=0;i<65;i++) {
-        cout<<"F:"<<A[i].x<<" "<<A[i].y<<endl;
-    }
-    cudaMemcpy(a_d,A,M*M*sizeof(cuDoubleComplex),cudaMemcpyHostToDevice);
-    invv(a_d,  M);
+    // for (int i=0;i<65;i++) {
+    //     cout<<"F:"<<A[i].x<<" "<<A[i].y<<endl;
+    // }
+    // cudaMemcpy(a_d,A,M*M*sizeof(cuDoubleComplex),cudaMemcpyHostToDevice);
+    // invv(a_d,  M);
 
     // cuDoubleComplex test[1024];
     // cudaMemcpy(test,c_d,M*M*sizeof(cuDoubleComplex),cudaMemcpyDeviceToHost);
